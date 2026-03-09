@@ -21,6 +21,9 @@ const SOL_USD_FEED_ID: [u8; 32] = [
 const SPL_TOKEN_PROGRAM: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SPL_TOKEN_2022_PROGRAM: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
+/// Allowed pool program owners (PumpSwap, Raydium, Orca, etc.)
+const PUMP_SWAP_PROGRAM: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
 // Account data offsets (oracle-price-main)
 const SPL_AMOUNT_OFFSET: usize = 64;
 const POOL_BASE_TOKEN_OFFSET: usize = 139;
@@ -33,7 +36,11 @@ const PYTH_PUBLISH_TIME_OFFSET: usize = 93;
 
 const MAX_PYTH_STALENESS: i64 = 60;
 const MAX_CONF_RATIO_X20: u64 = 20;
-const TWAP_SIZE: usize = 10;
+/// Minimum quote reserve (SOL side) in lamports to accept a pool (10 SOL)
+const MIN_POOL_LIQUIDITY_SOL: u64 = 10_000_000_000;
+/// Minimum base token reserve (raw units) to avoid extremely shallow pools
+const MIN_POOL_BASE_RESERVE: u64 = 1_000_000;
+const TWAP_SIZE: usize = 30;
 
 /// Target scale exponent for TOKEN/USD (consumer expects ×10^6)
 const TARGET_EXPONENT: i32 = -6;
@@ -46,27 +53,36 @@ const TARGET_EXPONENT: i32 = -6;
 pub mod meme_price_feed {
     use super::*;
 
-    /// Creates a synthetic Pyth-layout feed PDA for a pool.
-    /// Seeds: ["feed", pool.key()]. One feed per pool.
+    /// Creates a synthetic Pyth-layout feed PDA for one or more pools.
+    /// Seeds: ["feed", pool_0.key()]. Configure up to 3 pools via remaining_accounts (extra pool pubkeys).
     /// Access: permissionless (anyone can create a feed for any pool).
     pub fn initialize_feed(ctx: Context<InitializeFeed>) -> Result<()> {
         let feed = &mut ctx.accounts.feed;
-        feed.pool = ctx.accounts.pool.key();
+        let pool_0 = ctx.accounts.pool.key();
+        feed.pool_0 = pool_0;
+        let extra = ctx.remaining_accounts;
+        let pool_count = 1u8.saturating_add(extra.len() as u8).min(3);
+        feed.pool_count = pool_count;
         feed.bump = ctx.bumps.feed;
         feed.admin = ctx.accounts.payer.key();
         feed.exponent = TARGET_EXPONENT;
-        // last_slot, history_*, price, publish_time zeroed by init
+        feed.pools_1_2[0] = if extra.len() >= 1 { extra[0].key() } else { Pubkey::default() };
+        feed.pools_1_2[1] = if extra.len() >= 2 { extra[1].key() } else { Pubkey::default() };
         Ok(())
     }
 
-    /// Updates the feed: reads pool + Pyth SOL/USD, computes TOKEN/USD ×10^6,
-    /// optionally TWAP, writes Pyth layout at offsets 73, 89, 93.
-    /// Permissionless after warm-up (first 10 updates admin-only).
+    /// Updates the feed: reads up to 3 pools + Pyth SOL/USD, median TOKEN/USD ×10^6,
+    /// TWAP over 30 samples, writes Pyth layout at offsets 73, 89, 93.
+    /// Permissionless after warm-up (first 30 updates admin-only).
     pub fn update_price(ctx: Context<UpdatePrice>) -> Result<()> {
         let feed = &mut ctx.accounts.feed;
         let clock = Clock::get()?;
 
         require!(feed.last_slot < clock.slot, MemePriceFeedError::SlotAlreadyUpdated);
+        require!(
+            ctx.accounts.pool.key() == feed.pool_0,
+            MemePriceFeedError::PoolMismatch
+        );
 
         if feed.history_count < TWAP_SIZE as u8 {
             require!(
@@ -75,24 +91,67 @@ pub mod meme_price_feed {
             );
         }
 
-        let (price_e6, token_sol_e9, sol_usd_e6, base_reserve, quote_reserve) = calculate_price(
-            &ctx.accounts.pool,
-            &ctx.accounts.pool_base_token,
-            &ctx.accounts.pool_quote_token,
-            &ctx.accounts.pyth_sol_usd,
-            &clock,
-            feed.pool,
-        )?;
-
-        update_feed_state(
-            feed,
-            price_e6,
-            token_sol_e9,
-            sol_usd_e6,
-            base_reserve,
-            quote_reserve,
-            &clock,
+        let pool_count = feed.pool_count as usize;
+        require!(
+            ctx.remaining_accounts.len() >= (pool_count.saturating_sub(1)) * 3,
+            MemePriceFeedError::AccountDataTooSmall
         );
+
+        let (pyth_price, pyth_expo) = validate_pyth(&ctx.accounts.pyth_sol_usd, &clock)?;
+        let mut prices: [u64; 3] = [0; 3];
+        let mut n: usize = 0;
+
+        if pool_count >= 1 {
+            if let Some(p) = try_single_pool_price(
+                &ctx.accounts.pool,
+                &ctx.accounts.pool_base_token,
+                &ctx.accounts.pool_quote_token,
+                feed.pool_0,
+                pyth_price,
+                pyth_expo,
+            )? {
+                prices[n] = p;
+                n += 1;
+            }
+        }
+        if pool_count >= 2 && ctx.remaining_accounts.len() >= 3 {
+            let p1 = &ctx.remaining_accounts[0];
+            let b1 = &ctx.remaining_accounts[1];
+            let q1 = &ctx.remaining_accounts[2];
+            if let Some(p) = try_single_pool_price(
+                p1,
+                b1,
+                q1,
+                feed.pools_1_2[0],
+                pyth_price,
+                pyth_expo,
+            )? {
+                prices[n] = p;
+                n += 1;
+            }
+        }
+        if pool_count >= 3 && ctx.remaining_accounts.len() >= 6 {
+            let p2 = &ctx.remaining_accounts[3];
+            let b2 = &ctx.remaining_accounts[4];
+            let q2 = &ctx.remaining_accounts[5];
+            if let Some(p) = try_single_pool_price(
+                p2,
+                b2,
+                q2,
+                feed.pools_1_2[1],
+                pyth_price,
+                pyth_expo,
+            )? {
+                prices[n] = p;
+                n += 1;
+            }
+        }
+
+        require!(n >= 2, MemePriceFeedError::InsufficientLiquidity);
+
+        let price_e6 = median_of_3(&prices[..n]);
+
+        update_feed_state(feed, price_e6, &clock);
 
         Ok(())
     }
@@ -134,58 +193,16 @@ fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
     Ok(Pubkey::new_from_array(data[offset..offset + 32].try_into().unwrap()))
 }
 
-/// Calculate TOKEN/USD ×10^6 from PumpSwap pool reserves and Pyth SOL/USD.
-/// Returns (price_e6, token_sol_e9, sol_usd_e6, base_reserve, quote_reserve).
-fn calculate_price<'info>(
-    pool: &AccountInfo<'info>,
-    pool_base_token: &AccountInfo<'info>,
-    pool_quote_token: &AccountInfo<'info>,
+/// Validates Pyth SOL/USD feed and returns (price, exponent) for TOKEN/USD conversion.
+fn validate_pyth<'info>(
     pyth_price_feed: &AccountInfo<'info>,
     clock: &Clock,
-    expected_pool: Pubkey,
-) -> Result<(u64, u64, u64, u64, u64)> {
-    require!(pool.key() == expected_pool, MemePriceFeedError::PoolMismatch);
-    let pool_data = pool.try_borrow_data()?;
-    require!(
-        pool_data.len() >= 203,
-        MemePriceFeedError::AccountDataTooSmall
-    );
-
-    let expected_base = read_pubkey(&pool_data, POOL_BASE_TOKEN_OFFSET)?;
-    let expected_quote = read_pubkey(&pool_data, POOL_QUOTE_TOKEN_OFFSET)?;
-    require!(
-        pool_base_token.key() == expected_base,
-        MemePriceFeedError::PoolTokenMismatch
-    );
-    require!(
-        pool_quote_token.key() == expected_quote,
-        MemePriceFeedError::PoolTokenMismatch
-    );
-
-    require!(
-        *pool_base_token.owner == SPL_TOKEN_PROGRAM
-            || *pool_base_token.owner == SPL_TOKEN_2022_PROGRAM,
-        MemePriceFeedError::InvalidTokenOwner
-    );
-    require!(
-        *pool_quote_token.owner == SPL_TOKEN_PROGRAM
-            || *pool_quote_token.owner == SPL_TOKEN_2022_PROGRAM,
-        MemePriceFeedError::InvalidTokenOwner
-    );
-
-    let base_data = pool_base_token.try_borrow_data()?;
-    let quote_data = pool_quote_token.try_borrow_data()?;
-    let base_reserve = read_u64_le(&base_data, SPL_AMOUNT_OFFSET)?;
-    let quote_reserve = read_u64_le(&quote_data, SPL_AMOUNT_OFFSET)?;
-    require!(base_reserve > 0, MemePriceFeedError::ZeroReserve);
-    require!(quote_reserve > 0, MemePriceFeedError::ZeroReserve);
-
+) -> Result<(u64, i32)> {
     let pyth_owner = pyth_price_feed.owner;
     require!(
         *pyth_owner == PYTH_RECEIVER || *pyth_owner == PYTH_PUSH_ORACLE,
         MemePriceFeedError::InvalidPythOwner
     );
-
     let pyth_data = pyth_price_feed.try_borrow_data()?;
     require!(pyth_data.len() >= 102, MemePriceFeedError::AccountDataTooSmall);
 
@@ -201,28 +218,68 @@ fn calculate_price<'info>(
     let pyth_publish_time = read_i64_le(&pyth_data, PYTH_PUBLISH_TIME_OFFSET)?;
 
     require!(pyth_price_raw > 0, MemePriceFeedError::InvalidPythPrice);
-
     let age = clock.unix_timestamp.saturating_sub(pyth_publish_time);
     require!(
         age >= 0 && age <= MAX_PYTH_STALENESS,
         MemePriceFeedError::PythStale
     );
-
     let pyth_price = pyth_price_raw as u64;
     require!(
         pyth_conf.saturating_mul(MAX_CONF_RATIO_X20) < pyth_price,
         MemePriceFeedError::PythConfidenceTooWide
     );
+    Ok((pyth_price, pyth_expo))
+}
 
-    let token_sol_e9 =
-        ((quote_reserve as u128) * 1_000_000_000u128 / (base_reserve as u128)) as u64;
+/// Compute TOKEN/USD ×10^6 for one pool. Returns None if pool should be skipped (e.g. low liquidity).
+fn try_single_pool_price<'info>(
+    pool: &AccountInfo<'info>,
+    pool_base_token: &AccountInfo<'info>,
+    pool_quote_token: &AccountInfo<'info>,
+    expected_pool: Pubkey,
+    pyth_price: u64,
+    pyth_expo: i32,
+) -> Result<Option<u64>> {
+    if pool.key() != expected_pool || expected_pool == Pubkey::default() {
+        return Ok(None);
+    }
+    require!(
+        *pool.owner == PUMP_SWAP_PROGRAM,
+        MemePriceFeedError::InvalidPoolOwner
+    );
+    let pool_data = pool.try_borrow_data()?;
+    if pool_data.len() < 203 {
+        return Ok(None);
+    }
+    let expected_base = read_pubkey(&pool_data, POOL_BASE_TOKEN_OFFSET)?;
+    let expected_quote = read_pubkey(&pool_data, POOL_QUOTE_TOKEN_OFFSET)?;
+    require!(
+        pool_base_token.key() == expected_base,
+        MemePriceFeedError::PoolTokenMismatch
+    );
+    require!(
+        pool_quote_token.key() == expected_quote,
+        MemePriceFeedError::PoolTokenMismatch
+    );
+    require!(
+        *pool_base_token.owner == SPL_TOKEN_PROGRAM
+            || *pool_base_token.owner == SPL_TOKEN_2022_PROGRAM,
+        MemePriceFeedError::InvalidTokenOwner
+    );
+    require!(
+        *pool_quote_token.owner == SPL_TOKEN_PROGRAM
+            || *pool_quote_token.owner == SPL_TOKEN_2022_PROGRAM,
+        MemePriceFeedError::InvalidTokenOwner
+    );
 
-    let sol_usd_expo_sum: i32 = 6 + pyth_expo;
-    let sol_usd_e6: u64 = if sol_usd_expo_sum >= 0 {
-        (pyth_price as u128 * 10u128.pow(sol_usd_expo_sum as u32)) as u64
-    } else {
-        (pyth_price as u128 / 10u128.pow((-sol_usd_expo_sum) as u32)) as u64
-    };
+    let base_data = pool_base_token.try_borrow_data()?;
+    let quote_data = pool_quote_token.try_borrow_data()?;
+    let base_reserve = read_u64_le(&base_data, SPL_AMOUNT_OFFSET)?;
+    let quote_reserve = read_u64_le(&quote_data, SPL_AMOUNT_OFFSET)?;
+
+    if base_reserve < MIN_POOL_BASE_RESERVE || quote_reserve < MIN_POOL_LIQUIDITY_SOL {
+        return Ok(None);
+    }
 
     let expo_sum: i32 = 3 + pyth_expo;
     let (num, den) = if expo_sum >= 0 {
@@ -236,20 +293,36 @@ fn calculate_price<'info>(
             (base_reserve as u128) * 10u128.pow((-expo_sum) as u32),
         )
     };
-    require!(den > 0, MemePriceFeedError::ZeroReserve);
+    if den == 0 {
+        return Ok(None);
+    }
     let price_e6 = (num / den) as u64;
-    require!(price_e6 > 0, MemePriceFeedError::ZeroPrice);
+    if price_e6 == 0 {
+        return Ok(None);
+    }
+    Ok(Some(price_e6))
+}
 
-    Ok((price_e6, token_sol_e9, sol_usd_e6, base_reserve, quote_reserve))
+/// Constant-time median for 2 or 3 values (no sort). Uses u128 for overflow safety.
+#[inline(always)]
+fn median_of_3(prices: &[u64]) -> u64 {
+    match prices.len() {
+        2 => ((prices[0] as u128 + prices[1] as u128) / 2) as u64,
+        3 => {
+            let a = prices[0] as u128;
+            let b = prices[1] as u128;
+            let c = prices[2] as u128;
+            let min_p = a.min(b).min(c);
+            let max_p = a.max(b).max(c);
+            (a + b + c - min_p - max_p) as u64
+        }
+        _ => prices[0],
+    }
 }
 
 fn update_feed_state(
     feed: &mut Account<SyntheticFeed>,
     price_e6: u64,
-    _token_sol_e9: u64,
-    _sol_usd_e6: u64,
-    _base_reserve: u64,
-    _quote_reserve: u64,
     clock: &Clock,
 ) {
     let idx = feed.history_idx as usize;
@@ -288,7 +361,7 @@ pub struct InitializeFeed<'info> {
     )]
     pub feed: Account<'info, SyntheticFeed>,
 
-    /// CHECK: PumpSwap pool; validated on update_price
+    /// CHECK: First pool (PumpSwap/Raydium/Orca); used for PDA seeds. Validated on update_price.
     pub pool: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
@@ -301,12 +374,12 @@ pub struct UpdatePrice<'info> {
 
     #[account(
         mut,
-        seeds = [b"feed", feed.pool.as_ref()],
+        seeds = [b"feed", feed.pool_0.as_ref()],
         bump = feed.bump,
     )]
     pub feed: Account<'info, SyntheticFeed>,
 
-    /// CHECK: PumpSwap pool; validated against feed.pool
+    /// CHECK: First pool; validated against feed.pool_0
     pub pool: AccountInfo<'info>,
 
     /// CHECK: Pool base token account; validated against pool data
@@ -327,20 +400,24 @@ pub struct UpdatePrice<'info> {
 #[derive(InitSpace)]
 pub struct SyntheticFeed {
     // Header: 65 bytes so that price starts at byte 73 (8 discriminator + 65 = 73)
-    pub pool: Pubkey,           // 32
-    pub bump: u8,               // 1
-    pub last_slot: u64,         // 8
-    pub history_idx: u8,        // 1
-    pub history_count: u8,      // 1
-    pub _header_pad: [u8; 22], // 22 -> total 65
+    /// First pool (also used for PDA seeds)
+    pub pool_0: Pubkey,          // 32
+    pub pool_count: u8,          // 1  (1..=3)
+    pub bump: u8,                // 1
+    pub last_slot: u64,          // 8
+    pub history_idx: u8,         // 1
+    pub history_count: u8,       // 1
+    pub _header_pad: [u8; 21],   // 21 -> total 65
 
     // Pyth layout (when_meme_prediction reads these offsets)
-    pub price: i64,     // 8  @ 73  = TOKEN/USD × 10^6
+    pub price: i64,     // 8  @ 73  = TOKEN/USD × 10^6 (TWAP)
     pub _pad1: [u8; 8], // 8  @ 81
     pub exponent: i32,     // 4  @ 89  = -6
     pub publish_time: i64, // 8  @ 93  = unix timestamp
 
-    pub price_history: [u64; 10], // 80  TWAP ring buffer
+    /// Pools 1 and 2 (pool_0 is in header)
+    pub pools_1_2: [Pubkey; 2],  // 64
+    pub price_history: [u64; 30], // 240  TWAP ring buffer
     pub admin: Pubkey,            // 32
 }
 
@@ -352,7 +429,7 @@ pub struct SyntheticFeed {
 pub enum MemePriceFeedError {
     #[msg("Price already updated this slot")]
     SlotAlreadyUpdated,
-    #[msg("Only admin can update during warm-up (first 10 updates)")]
+    #[msg("Only admin can update during warm-up (first 30 updates)")]
     WarmupAdminOnly,
     #[msg("Pool address does not match feed PDA")]
     PoolMismatch,
@@ -376,4 +453,8 @@ pub enum MemePriceFeedError {
     ZeroPrice,
     #[msg("Account data too small for expected read")]
     AccountDataTooSmall,
+    #[msg("At least two valid pools required (liquidity/min reserve not met)")]
+    InsufficientLiquidity,
+    #[msg("Pool account not owned by allowed AMM program")]
+    InvalidPoolOwner,
 }
